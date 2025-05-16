@@ -1,0 +1,287 @@
+import logging
+import datetime
+
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+)
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, ConversationHandler, filters
+)
+
+from config import BOT_TOKEN
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Состояния
+MAIN_MENU, SELECT_ACTION, SELECT_DATE, ENTER_TASK, DELETE_TASK = range(5)
+CHOOSE_ALARM, SET_ALARM_TIME = range(5, 7)
+
+
+# --- Клавиатуры ---
+def main_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Ежедневник"), KeyboardButton("Будильник")],
+            [KeyboardButton("Помощь")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def daily_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Добавить задачу"), KeyboardButton("Посмотреть задачи")],
+            [KeyboardButton("Удалить задачу"), KeyboardButton("В главное меню")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def alarm_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Установить будильник"), KeyboardButton("В главное меню")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def date_select_keyboard():
+    today = datetime.date.today()
+    tomorrow = today + datetime.timedelta(days=1)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Сегодня ({today.strftime('%d.%m.%Y')})", callback_data=f"date_{today}")],
+        [InlineKeyboardButton(f"Завтра ({tomorrow.strftime('%d.%m.%Y')})", callback_data=f"date_{tomorrow}")],
+        [InlineKeyboardButton("Другая дата", callback_data="date_other")]
+    ])
+
+
+def delete_task_keyboard(tasks):
+    keyboard = [
+        [InlineKeyboardButton(f"{i+1}. {task['text']} ({task['date']})", callback_data=f"del_{i}")]
+        for i, task in enumerate(tasks)
+    ]
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="back")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+# --- Обработчики ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я бот-ежедневник и будильник.\nВыберите режим:",
+        reply_markup=main_menu_keyboard()
+    )
+    return MAIN_MENU
+
+
+# --- Главное меню ---
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Ежедневник":
+        await update.message.reply_text("Выберите действие:", reply_markup=daily_menu_keyboard())
+        return SELECT_ACTION
+    elif text == "Будильник":
+        await update.message.reply_text("Меню будильника:", reply_markup=alarm_menu_keyboard())
+        return CHOOSE_ALARM
+    elif text == "Помощь":
+        await update.message.reply_text(
+            "Я могу быть вашим ежедневником и будильником!\n"
+            "Выберите 'Ежедневник' - чтобы вести задачи.\n"
+            "Выберите 'Будильник' - чтобы установить напоминание по времени."
+        )
+        return MAIN_MENU
+    else:
+        await update.message.reply_text("Пожалуйста, выберите действие с клавиатуры.")
+        return MAIN_MENU
+
+
+# --- Ежедневник ---
+async def select_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Добавить задачу":
+        await update.message.reply_text("Выберите дату для задачи:", reply_markup=date_select_keyboard())
+        return SELECT_DATE
+    elif text == "Посмотреть задачи":
+        return await show_tasks(update, context)
+    elif text == "Удалить задачу":
+        return await start_delete_task(update, context)
+    elif text == "В главное меню":
+        await update.message.reply_text("Главное меню:", reply_markup=main_menu_keyboard())
+        return MAIN_MENU
+    else:
+        await update.message.reply_text("Пожалуйста, выберите действие с клавиатуры.")
+        return SELECT_ACTION
+
+
+async def select_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("date_"):
+        if data == "date_other":
+            await query.edit_message_text("Введите дату в формате ДД.ММ.ГГГГ:")
+            return SELECT_DATE
+        else:
+            date_str = data[5:]
+            context.user_data["selected_date"] = date_str
+            await query.edit_message_text(f"Введите задачу на {date_str}:")
+            return ENTER_TASK
+    else:
+        await query.edit_message_text("Ошибка выбора даты.")
+        return SELECT_ACTION
+
+
+async def manual_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_text = update.message.text
+    try:
+        date_obj = datetime.datetime.strptime(date_text, "%d.%m.%Y").date()
+        context.user_data["selected_date"] = str(date_obj)
+        await update.message.reply_text(f"Введите задачу на {date_obj}:")
+        return ENTER_TASK
+    except ValueError:
+        await update.message.reply_text("Некорректный формат даты! Введите в формате ДД.ММ.ГГГГ.")
+        return SELECT_DATE
+
+
+async def enter_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_text = update.message.text
+    date_str = context.user_data.get("selected_date")
+    if not date_str:
+        await update.message.reply_text("Ошибка: дата не выбрана.")
+        return SELECT_ACTION
+
+    tasks = context.user_data.setdefault("tasks", [])
+    tasks.append({"text": task_text, "date": date_str})
+    await update.message.reply_text(
+        f"Задача добавлена: {task_text} ({date_str})",
+        reply_markup=daily_menu_keyboard()
+    )
+    return SELECT_ACTION
+
+
+async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasks = context.user_data.get("tasks", [])
+    if not tasks:
+        await update.message.reply_text("У вас нет задач.", reply_markup=daily_menu_keyboard())
+        return SELECT_ACTION
+
+    msg = "Ваши задачи:\n"
+    for i, task in enumerate(tasks, 1):
+        msg += f"{i}. {task['text']} ({task['date']})\n"
+    await update.message.reply_text(msg, reply_markup=daily_menu_keyboard())
+    return SELECT_ACTION
+
+
+async def start_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tasks = context.user_data.get("tasks", [])
+    if not tasks:
+        await update.message.reply_text("Нет задач для удаления.", reply_markup=daily_menu_keyboard())
+        return SELECT_ACTION
+    await update.message.reply_text("Выберите задачу для удаления:", reply_markup=delete_task_keyboard(tasks))
+    return DELETE_TASK
+
+
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "back":
+        await query.edit_message_text("Удаление отменено.", reply_markup=daily_menu_keyboard())
+        return SELECT_ACTION
+
+    if data.startswith("del_"):
+        idx = int(data[4:])
+        tasks = context.user_data.get("tasks", [])
+        if 0 <= idx < len(tasks):
+            removed = tasks.pop(idx)
+            await query.edit_message_text(
+                f"Задача удалена: {removed['text']} ({removed['date']})",
+                reply_markup=daily_menu_keyboard()
+            )
+        else:
+            await query.edit_message_text("Ошибка: задача не найдена.", reply_markup=daily_menu_keyboard())
+        return SELECT_ACTION
+
+
+# --- Будильник ---
+async def choose_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Установить будильник":
+        await update.message.reply_text(
+            "Пожалуйста, введите время в формате ЧЧ:ММ (например 07:30)",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return SET_ALARM_TIME
+    elif text == "В главное меню":
+        await update.message.reply_text("Главное меню:", reply_markup=main_menu_keyboard())
+        return MAIN_MENU
+    else:
+        await update.message.reply_text("Пожалуйста, используйте кнопки для выбора действия.")
+        return CHOOSE_ALARM
+
+
+async def set_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_time = update.message.text
+    try:
+        alarm_time = datetime.datetime.strptime(user_time, "%H:%M").time()
+        now = datetime.datetime.now().time()
+        now_dt = datetime.datetime.now()
+        alarm_dt = datetime.datetime.combine(now_dt.date(), alarm_time)
+        if alarm_dt <= now_dt:
+            alarm_dt += datetime.timedelta(days=1)
+        delay = (alarm_dt - now_dt).total_seconds()
+        context.job_queue.run_once(alarm_callback, delay, chat_id=update.effective_chat.id)
+        await update.message.reply_text(f"✅ Будильник установлен на {user_time}", reply_markup=alarm_menu_keyboard())
+        return CHOOSE_ALARM
+
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Используйте ЧЧ:ММ (например 07:30)")
+        return SET_ALARM_TIME
+
+
+async def alarm_callback(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    await context.bot.send_message(job.chat_id, text="⏰⏰⏰ Будильник сработал! ⏰⏰⏰")
+
+
+# --- Отмена ---
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Действие отменено.", reply_markup=main_menu_keyboard())
+    return MAIN_MENU
+
+
+# --- MAIN ---
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu)],
+            SELECT_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_action)],
+            SELECT_DATE: [
+                CallbackQueryHandler(select_date),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, manual_date)
+            ],
+            ENTER_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_task)],
+            DELETE_TASK: [CallbackQueryHandler(delete_task)],
+            CHOOSE_ALARM: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_alarm)],
+            SET_ALARM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_alarm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
+
+    application.add_handler(conv_handler)
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
